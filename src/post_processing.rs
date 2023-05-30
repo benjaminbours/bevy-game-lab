@@ -1,14 +1,11 @@
 use bevy::{
-    core_pipeline::{
-        clear_color::ClearColorConfig, core_3d,
-        fullscreen_vertex_shader::fullscreen_shader_vertex_state,
-    },
+    core_pipeline::{core_3d, fullscreen_vertex_shader::fullscreen_shader_vertex_state},
     prelude::{App, AssetServer, Component, FromWorld, Plugin, QueryState, Resource, With, World},
     render::{
         extract_component::{
             ComponentUniforms, ExtractComponent, ExtractComponentPlugin, UniformComponentPlugin,
         },
-        render_graph::{Node, NodeRunError, RenderGraphContext},
+        render_graph::{Node, NodeRunError, RenderGraph, RenderGraphContext, SlotInfo, SlotType},
         render_resource::{
             BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
             BindGroupLayoutEntry, BindingResource, BindingType, CachedRenderPipelineId,
@@ -47,44 +44,49 @@ impl Plugin for PostProcessPlugin {
             return;
         };
 
-        render_app
-            // Bevy's renderer uses a render graph which is a collection of nodes in a directed acyclic graph.
-            // It currently runs on each view/camera and executes each node in the specified order.
-            // It will make sure that any node that needs a dependency from another node
-            // only runs when that dependency is done.
-            //
-            // Each node can execute arbitrary work, but it generally runs at least one render pass.
-            // A node only has access to the render world, so if you need data from the main world
-            // you need to extract it manually or with the plugin like above.
-            // Add a [`Node`] to the [`RenderGraph`]
-            // The Node needs to impl FromWorld
-            .add_render_graph_node::<PostProcessNode>(
-                // Specifiy the name of the graph, in this case we want the graph for 3d
-                core_3d::graph::NAME,
-                // It also needs the name of the node
-                PostProcessNode::NAME,
-            )
-            .add_render_graph_edges(
-                core_3d::graph::NAME,
-                // Specify the node ordering.
-                // This will automatically create all required node edges to enforce the given ordering.
-                &[
-                    core_3d::graph::node::TONEMAPPING,
-                    PostProcessNode::NAME,
-                    core_3d::graph::node::END_MAIN_PASS_POST_PROCESSING,
-                ],
-            );
-    }
+        // Initialize the pipeline
+        render_app.init_resource::<PostProcessPipeline>();
 
-    fn finish(&self, app: &mut App) {
-        // We need to get the render app from the main app
-        let Ok(render_app) = app.get_sub_app_mut(RenderApp) else {
-            return;
-        };
+        // Bevy's renderer uses a render graph which is a collection of nodes in a directed acyclic graph.
+        // It currently runs on each view/camera and executes each node in the specified order.
+        // It will make sure that any node that needs a dependency from another node
+        // only runs when that dependency is done.
+        //
+        // Each node can execute arbitrary work, but it generally runs at least one render pass.
+        // A node only has access to the render world, so if you need data from the main world
+        // you need to extract it manually or with the plugin like above.
 
-        render_app
-            // Initialize the pipeline
-            .init_resource::<PostProcessPipeline>();
+        // Create the node with the render world
+        let node = PostProcessNode::new(&mut render_app.world);
+
+        // Get the render graph for the entire app
+        let mut graph = render_app.world.resource_mut::<RenderGraph>();
+
+        // Get the render graph for 3d cameras/views
+        let core_3d_graph = graph.get_sub_graph_mut(core_3d::graph::NAME).unwrap();
+
+        // Register the post process node in the 3d render graph
+        core_3d_graph.add_node(PostProcessNode::NAME, node);
+
+        // A slot edge tells the render graph which input/output value should be passed to the node.
+        // In this case, the view entity, which is the entity associated with the
+        // camera on which the graph is running.
+        core_3d_graph.add_slot_edge(
+            core_3d_graph.input_node().id,
+            core_3d::graph::input::VIEW_ENTITY,
+            PostProcessNode::NAME,
+            PostProcessNode::IN_VIEW,
+        );
+
+        // We now need to add an edge between our node and the nodes from bevy
+        // to make sure our node is ordered correctly relative to other nodes.
+        //
+        // Here we want our effect to run after tonemapping and before the end of the main pass post processing
+        core_3d_graph.add_node_edge(core_3d::graph::node::TONEMAPPING, PostProcessNode::NAME);
+        core_3d_graph.add_node_edge(
+            PostProcessNode::NAME,
+            core_3d::graph::node::END_MAIN_PASS_POST_PROCESSING,
+        );
     }
 }
 
@@ -96,7 +98,14 @@ struct PostProcessNode {
 }
 
 impl PostProcessNode {
+    pub const IN_VIEW: &str = "view";
     pub const NAME: &str = "post_process";
+
+    fn new(world: &mut World) -> Self {
+        Self {
+            query: QueryState::new(world),
+        }
+    }
 }
 
 impl FromWorld for PostProcessNode {
@@ -108,6 +117,13 @@ impl FromWorld for PostProcessNode {
 }
 
 impl Node for PostProcessNode {
+    // This defines the input slot of the node and tells the render graph what
+    // we will need when running the node.
+    fn input(&self) -> Vec<SlotInfo> {
+        // In this case we tell the graph that our node will use the view entity.
+        // Currently, every node in bevy uses this pattern, so it's safe to just copy it.
+        vec![SlotInfo::new(PostProcessNode::IN_VIEW, SlotType::Entity)]
+    }
     // This will run every frame before the run() method
     // The important difference is that `self` is `mut` here
     fn update(&mut self, world: &mut World) {
@@ -129,7 +145,7 @@ impl Node for PostProcessNode {
         world: &World,
     ) -> Result<(), NodeRunError> {
         // Get the entity of the view for the render graph where this node is running
-        let view_entity = graph_context.view_entity();
+        let view_entity = graph_context.get_input_entity(PostProcessNode::IN_VIEW)?;
 
         // We get the data we need from the world based on the view entity passed to the node.
         // The data is the query that was defined earlier in the [`PostProcessNode`]
@@ -269,9 +285,9 @@ impl FromWorld for PostProcessPipeline {
         let sampler = render_device.create_sampler(&SamplerDescriptor::default());
 
         // Get the shader handle
-        let shader = world
+        let fragment_shader = world
             .resource::<AssetServer>()
-            .load("shaders/post_processing.wgsl");
+            .load("additive_blending.frag");
 
         let pipeline_id = world
             .resource_mut::<PipelineCache>()
@@ -282,11 +298,11 @@ impl FromWorld for PostProcessPipeline {
                 // This will setup a fullscreen triangle for the vertex state
                 vertex: fullscreen_shader_vertex_state(),
                 fragment: Some(FragmentState {
-                    shader,
+                    shader: fragment_shader,
                     shader_defs: vec![],
                     // Make sure this matches the entry point of your shader.
                     // It can be anything as long as it matches here and in the shader.
-                    entry_point: "fragment".into(),
+                    entry_point: "main".into(),
                     targets: vec![Some(ColorTargetState {
                         format: TextureFormat::bevy_default(),
                         blend: None,
@@ -311,6 +327,7 @@ impl FromWorld for PostProcessPipeline {
 
 // This is the component that will get passed to the shader
 #[derive(Component, Default, Clone, Copy, ExtractComponent, ShaderType)]
-struct PostProcessSettings {
-    intensity: f32,
+pub struct PostProcessSettings {
+    pub intensity: f32,
+    pub other: f32,
 }
