@@ -18,7 +18,8 @@ layout(set = 1, binding = 2) uniform float decay;
 layout(set = 1, binding = 3) uniform float density;
 layout(set = 1, binding = 4) uniform float weight;
 layout(set = 1, binding = 5) uniform int samples;
-layout(set = 1, binding = 6) uniform sampler tDiffuse;
+layout(set = 1, binding = 6) uniform texture2D tDiffuse_texture;
+layout(set = 1, binding = 7) uniform sampler tDiffuse_sampler;
 const int MAX_SAMPLES = 100;
 
 void main(){
@@ -29,7 +30,7 @@ void main(){
   // Divide by number of samples and scale by control factor
   deltaTextCoord *= 1.0 / float(samples) * density;
   // Store initial sample
-  vec4 color = texture(sampler2D(tDiffuse), texCoord);
+  vec4 color = texture(sampler2D(tDiffuse_texture,tDiffuse_sampler), texCoord);
   // set up illumination decay factor
   float illuminationDecay = 1.0;
   
@@ -41,13 +42,13 @@ void main(){
     }
     
     // step sample location along ray
-    texCoord -= deltaTextCoord
+    texCoord -= deltaTextCoord;
     // retrieve sample at new location
-    vec4 sample = texture(tDiffuse, texCoord);
+    vec4 sampleVec = texture(sampler2D(tDiffuse_texture,tDiffuse_sampler), texCoord);
     // apply sample attenuation scale/decay factors
-    sample *= illuminationDecay * weight;
+    sampleVec *= illuminationDecay * weight;
     // accumulate combined color
-    color += sample;
+    color += sampleVec;
     // update exponential decay factor
     illuminationDecay *= decay;
   
