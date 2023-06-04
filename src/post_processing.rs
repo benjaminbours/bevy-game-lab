@@ -1,333 +1,230 @@
 use bevy::{
-    core_pipeline::{core_3d, fullscreen_vertex_shader::fullscreen_shader_vertex_state},
-    prelude::{App, AssetServer, Component, FromWorld, Plugin, QueryState, Resource, With, World},
-    render::{
-        extract_component::{
-            ComponentUniforms, ExtractComponent, ExtractComponentPlugin, UniformComponentPlugin,
-        },
-        render_graph::{Node, NodeRunError, RenderGraph, RenderGraphContext, SlotInfo, SlotType},
-        render_resource::{
-            BindGroupDescriptor, BindGroupEntry, BindGroupLayout, BindGroupLayoutDescriptor,
-            BindGroupLayoutEntry, BindingResource, BindingType, CachedRenderPipelineId,
-            ColorTargetState, ColorWrites, FragmentState, MultisampleState, Operations,
-            PipelineCache, PrimitiveState, RenderPassColorAttachment, RenderPassDescriptor,
-            RenderPipelineDescriptor, Sampler, SamplerBindingType, SamplerDescriptor, ShaderStages,
-            ShaderType, TextureFormat, TextureSampleType, TextureViewDimension,
-        },
-        renderer::{RenderContext, RenderDevice},
-        texture::BevyDefault,
-        view::{ExtractedView, ViewTarget},
-        RenderApp,
+    core_pipeline::clear_color::ClearColorConfig,
+    prelude::{
+        default, shape, App, Assets, Camera, Camera2d, Camera2dBundle, Camera3d, Camera3dBundle,
+        Color, Commands, Component, Handle, Image, Mesh, PbrBundle, Plugin, PointLight,
+        PointLightBundle, Query, ResMut, StandardMaterial, Transform, UiCameraConfig, Vec2, Vec3,
     },
+    reflect::TypeUuid,
+    render::{
+        camera::RenderTarget,
+        mesh::MeshVertexBufferLayout,
+        render_resource::{
+            AsBindGroup, Extent3d, RenderPipelineDescriptor, ShaderRef,
+            SpecializedMeshPipelineError, TextureDescriptor, TextureDimension, TextureFormat,
+            TextureUsages,
+        },
+        texture::BevyDefault,
+        view::RenderLayers,
+    },
+    sprite::{Material2d, Material2dKey, Material2dPlugin, MaterialMesh2dBundle},
+    window::Window,
 };
+
+use crate::entities::player::Player;
+
+/// Marks the first camera cube (rendered to a texture.)
+#[derive(Component)]
+pub struct PointLightPlayer;
+
+#[derive(Component)]
+pub struct MainCamera;
 
 /// It is generally encouraged to set up post processing effects as a plugin
 pub struct PostProcessPlugin;
 
-impl Plugin for PostProcessPlugin {
-    fn build(&self, app: &mut App) {
-        app
-            // The settings will be a component that lives in the main world but will
-            // be extracted to the render world every frame.
-            // This makes it possible to control the effect from the main world.
-            // This plugin will take care of extracting it automatically.
-            // It's important to derive [`ExtractComponent`] on [`PostProcessingSettings`]
-            // for this plugin to work correctly.
-            .add_plugin(ExtractComponentPlugin::<PostProcessSettings>::default())
-            // The settings will also be the data used in the shader.
-            // This plugin will prepare the component for the GPU by creating a uniform buffer
-            // and writing the data to that buffer every frame.
-            .add_plugin(UniformComponentPlugin::<PostProcessSettings>::default());
-
-        // We need to get the render app from the main app
-        let Ok(render_app) = app.get_sub_app_mut(RenderApp) else {
-            return;
-        };
-
-        // Initialize the pipeline
-        render_app.init_resource::<PostProcessPipeline>();
-
-        // Bevy's renderer uses a render graph which is a collection of nodes in a directed acyclic graph.
-        // It currently runs on each view/camera and executes each node in the specified order.
-        // It will make sure that any node that needs a dependency from another node
-        // only runs when that dependency is done.
-        //
-        // Each node can execute arbitrary work, but it generally runs at least one render pass.
-        // A node only has access to the render world, so if you need data from the main world
-        // you need to extract it manually or with the plugin like above.
-
-        // Create the node with the render world
-        let node = PostProcessNode::new(&mut render_app.world);
-
-        // Get the render graph for the entire app
-        let mut graph = render_app.world.resource_mut::<RenderGraph>();
-
-        // Get the render graph for 3d cameras/views
-        let core_3d_graph = graph.get_sub_graph_mut(core_3d::graph::NAME).unwrap();
-
-        // Register the post process node in the 3d render graph
-        core_3d_graph.add_node(PostProcessNode::NAME, node);
-
-        // A slot edge tells the render graph which input/output value should be passed to the node.
-        // In this case, the view entity, which is the entity associated with the
-        // camera on which the graph is running.
-        core_3d_graph.add_slot_edge(
-            core_3d_graph.input_node().id,
-            core_3d::graph::input::VIEW_ENTITY,
-            PostProcessNode::NAME,
-            PostProcessNode::IN_VIEW,
-        );
-
-        // We now need to add an edge between our node and the nodes from bevy
-        // to make sure our node is ordered correctly relative to other nodes.
-        //
-        // Here we want our effect to run after tonemapping and before the end of the main pass post processing
-        core_3d_graph.add_node_edge(core_3d::graph::node::TONEMAPPING, PostProcessNode::NAME);
-        core_3d_graph.add_node_edge(
-            PostProcessNode::NAME,
-            core_3d::graph::node::END_MAIN_PASS_POST_PROCESSING,
-        );
-    }
+/// Our custom post processing material
+#[derive(AsBindGroup, TypeUuid, Clone)]
+#[uuid = "bc2f08eb-a0fb-43f1-a908-54871ea597d5"]
+pub struct PostProcessingMaterial {
+    #[uniform(0)]
+    pub light_position: Vec2,
+    #[uniform(1)]
+    exposure: f32,
+    #[uniform(2)]
+    decay: f32,
+    #[uniform(3)]
+    density: f32,
+    #[uniform(4)]
+    weight: f32,
+    #[uniform(5)]
+    samples: i32,
+    #[texture(6)]
+    #[sampler(7)]
+    color_texture: Handle<Image>,
 }
 
-/// The post process node used for the render graph
-struct PostProcessNode {
-    // The node needs a query to gather data from the ECS in order to do its rendering,
-    // but it's not a normal system so we need to define it manually.
-    query: QueryState<&'static ViewTarget, With<ExtractedView>>,
-}
-
-impl PostProcessNode {
-    pub const IN_VIEW: &str = "view";
-    pub const NAME: &str = "post_process";
-
-    fn new(world: &mut World) -> Self {
-        Self {
-            query: QueryState::new(world),
-        }
-    }
-}
-
-impl FromWorld for PostProcessNode {
-    fn from_world(world: &mut World) -> Self {
-        Self {
-            query: QueryState::new(world),
-        }
-    }
-}
-
-impl Node for PostProcessNode {
-    // This defines the input slot of the node and tells the render graph what
-    // we will need when running the node.
-    fn input(&self) -> Vec<SlotInfo> {
-        // In this case we tell the graph that our node will use the view entity.
-        // Currently, every node in bevy uses this pattern, so it's safe to just copy it.
-        vec![SlotInfo::new(PostProcessNode::IN_VIEW, SlotType::Entity)]
-    }
-    // This will run every frame before the run() method
-    // The important difference is that `self` is `mut` here
-    fn update(&mut self, world: &mut World) {
-        // Since this is not a system we need to update the query manually.
-        // This is mostly boilerplate. There are plans to remove this in the future.
-        // For now, you can just copy it.
-        self.query.update_archetypes(world);
+impl Material2d for PostProcessingMaterial {
+    fn vertex_shader() -> ShaderRef {
+        "volumetric_light.vert".into()
     }
 
-    // Runs the node logic
-    // This is where you encode draw commands.
-    //
-    // This will run on every view on which the graph is running. If you don't want your effect to run on every camera,
-    // you'll need to make sure you have a marker component to identify which camera(s) should run the effect.
-    fn run(
-        &self,
-        graph_context: &mut RenderGraphContext,
-        render_context: &mut RenderContext,
-        world: &World,
-    ) -> Result<(), NodeRunError> {
-        // Get the entity of the view for the render graph where this node is running
-        let view_entity = graph_context.get_input_entity(PostProcessNode::IN_VIEW)?;
+    fn fragment_shader() -> ShaderRef {
+        "volumetric_light.frag".into()
+    }
 
-        // We get the data we need from the world based on the view entity passed to the node.
-        // The data is the query that was defined earlier in the [`PostProcessNode`]
-        let Ok(view_target) = self.query.get_manual(world, view_entity) else {
-            return Ok(());
-        };
-
-        // Get the pipeline resource that contains the global data we need to create the render pipeline
-        let post_process_pipeline = world.resource::<PostProcessPipeline>();
-
-        // The pipeline cache is a cache of all previously created pipelines.
-        // It is required to avoid creating a new pipeline each frame, which is expensive due to shader compilation.
-        let pipeline_cache = world.resource::<PipelineCache>();
-
-        // Get the pipeline from the cache
-        let Some(pipeline) = pipeline_cache.get_render_pipeline(post_process_pipeline.pipeline_id) else {
-            return Ok(());
-        };
-
-        // Get the settings uniform binding
-        let settings_uniforms = world.resource::<ComponentUniforms<PostProcessSettings>>();
-        let Some(settings_binding) = settings_uniforms.uniforms().binding() else {
-            return Ok(());
-        };
-
-        // This will start a new "post process write", obtaining two texture
-        // views from the view target - a `source` and a `destination`.
-        // `source` is the "current" main texture and you _must_ write into
-        // `destination` because calling `post_process_write()` on the
-        // [`ViewTarget`] will internally flip the [`ViewTarget`]'s main
-        // texture to the `destination` texture. Failing to do so will cause
-        // the current main texture information to be lost.
-        let post_process = view_target.post_process_write();
-
-        // The bind_group gets created each frame.
-        //
-        // Normally, you would create a bind_group in the Queue set, but this doesn't work with the post_process_write().
-        // The reason it doesn't work is because each post_process_write will alternate the source/destination.
-        // The only way to have the correct source/destination for the bind_group is to make sure you get it during the node execution.
-        let bind_group = render_context
-            .render_device()
-            .create_bind_group(&BindGroupDescriptor {
-                label: Some("post_process_bind_group"),
-                layout: &post_process_pipeline.layout,
-                // It's important for this to match the BindGroupLayout defined in the PostProcessPipeline
-                entries: &[
-                    BindGroupEntry {
-                        binding: 0,
-                        // Make sure to use the source view
-                        resource: BindingResource::TextureView(post_process.source),
-                    },
-                    BindGroupEntry {
-                        binding: 1,
-                        // Use the sampler created for the pipeline
-                        resource: BindingResource::Sampler(&post_process_pipeline.sampler),
-                    },
-                    BindGroupEntry {
-                        binding: 2,
-                        // Set the settings binding
-                        resource: settings_binding.clone(),
-                    },
-                ],
-            });
-
-        // Begin the render pass
-        let mut render_pass = render_context.begin_tracked_render_pass(RenderPassDescriptor {
-            label: Some("post_process_pass"),
-            color_attachments: &[Some(RenderPassColorAttachment {
-                // We need to specify the post process destination view here
-                // to make sure we write to the appropriate texture.
-                view: post_process.destination,
-                resolve_target: None,
-                ops: Operations::default(),
-            })],
-            depth_stencil_attachment: None,
-        });
-
-        // This is mostly just wgpu boilerplate for drawing a fullscreen triangle,
-        // using the pipeline/bind_group created above
-        render_pass.set_render_pipeline(pipeline);
-        render_pass.set_bind_group(0, &bind_group, &[]);
-        render_pass.draw(0..3, 0..1);
-
+    // Bevy assumes by default that vertex shaders use the "vertex" entry point
+    // and fragment shaders use the "fragment" entry point (for WGSL shaders).
+    // GLSL uses "main" as the entry point, so we must override the defaults here
+    fn specialize(
+        descriptor: &mut RenderPipelineDescriptor,
+        _layout: &MeshVertexBufferLayout,
+        _key: Material2dKey<Self>,
+    ) -> Result<(), SpecializedMeshPipelineError> {
+        descriptor.vertex.entry_point = "main".into();
+        descriptor.fragment.as_mut().unwrap().entry_point = "main".into();
         Ok(())
     }
 }
 
-// This contains global data used by the render pipeline. This will be created once on startup.
-#[derive(Resource)]
-struct PostProcessPipeline {
-    layout: BindGroupLayout,
-    sampler: Sampler,
-    pipeline_id: CachedRenderPipelineId,
-}
-
-impl FromWorld for PostProcessPipeline {
-    fn from_world(world: &mut World) -> Self {
-        let render_device = world.resource::<RenderDevice>();
-
-        // We need to define the bind group layout used for our pipeline
-        let layout = render_device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-            label: Some("post_process_bind_group_layout"),
-            entries: &[
-                // The screen texture
-                BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Texture {
-                        sample_type: TextureSampleType::Float { filterable: true },
-                        view_dimension: TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                // The sampler that will be used to sample the screen texture
-                BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                    count: None,
-                },
-                // The settings uniform that will control the effect
-                BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: ShaderStages::FRAGMENT,
-                    ty: BindingType::Buffer {
-                        ty: bevy::render::render_resource::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-
-        // We can create the sampler here since it won't change at runtime and doesn't depend on the view
-        let sampler = render_device.create_sampler(&SamplerDescriptor::default());
-
-        // Get the shader handle
-        let fragment_shader = world
-            .resource::<AssetServer>()
-            .load("additive_blending.frag");
-
-        let pipeline_id = world
-            .resource_mut::<PipelineCache>()
-            // This will add the pipeline to the cache and queue it's creation
-            .queue_render_pipeline(RenderPipelineDescriptor {
-                label: Some("post_process_pipeline".into()),
-                layout: vec![layout.clone()],
-                // This will setup a fullscreen triangle for the vertex state
-                vertex: fullscreen_shader_vertex_state(),
-                fragment: Some(FragmentState {
-                    shader: fragment_shader,
-                    shader_defs: vec![],
-                    // Make sure this matches the entry point of your shader.
-                    // It can be anything as long as it matches here and in the shader.
-                    entry_point: "main".into(),
-                    targets: vec![Some(ColorTargetState {
-                        format: TextureFormat::bevy_default(),
-                        blend: None,
-                        write_mask: ColorWrites::ALL,
-                    })],
-                }),
-                // All of the following property are not important for this effect so just use the default values.
-                // This struct doesn't have the Default trai implemented because not all field can have a default value.
-                primitive: PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: MultisampleState::default(),
-                push_constant_ranges: vec![],
-            });
-
-        Self {
-            layout,
-            sampler,
-            pipeline_id,
-        }
+impl Plugin for PostProcessPlugin {
+    fn build(&self, app: &mut App) {
+        app.add_plugin(Material2dPlugin::<PostProcessingMaterial>::default())
+            .add_startup_system(setup);
     }
 }
 
-// This is the component that will get passed to the shader
-#[derive(Component, Default, Clone, Copy, ExtractComponent, ShaderType)]
-pub struct PostProcessSettings {
-    pub intensity: f32,
-    pub other: f32,
+fn setup(
+    mut commands: Commands,
+    windows: Query<&Window>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    mut post_processing_materials: ResMut<Assets<PostProcessingMaterial>>,
+    mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
+) {
+    // This assumes we only have a single window
+    let window = windows.single();
+
+    let size = Extent3d {
+        width: window.resolution.physical_width(),
+        height: window.resolution.physical_height(),
+        ..default()
+    };
+
+    // This is the texture that will be rendered to.
+    let mut image = Image {
+        texture_descriptor: TextureDescriptor {
+            label: None,
+            size,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::bevy_default(),
+            mip_level_count: 1,
+            sample_count: 1,
+            usage: TextureUsages::TEXTURE_BINDING
+                | TextureUsages::COPY_DST
+                | TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        },
+        ..default()
+    };
+
+    // fill image.data with zeroes
+    image.resize(size);
+
+    let image_handle = images.add(image);
+
+    let cube_handle = meshes.add(Mesh::from(shape::Cube { size: 4.0 }));
+    let cube_material_handle = materials.add(StandardMaterial {
+        base_color: Color::hex("ffffff").unwrap(),
+        reflectance: 0.02,
+        unlit: true,
+        ..default()
+    });
+
+    // The cube that will be rendered to the texture.
+    commands.spawn((
+        Player,
+        PbrBundle {
+            mesh: cube_handle,
+            material: cube_material_handle,
+            transform: Transform::from_translation(Vec3::new(0.0, 0.0, 1.0)),
+            ..default()
+        },
+    ));
+
+    // light
+    commands.spawn((
+        PointLightPlayer,
+        PointLightBundle {
+            point_light: PointLight {
+                intensity: 1500.0,
+                shadows_enabled: true,
+                ..default()
+            },
+            transform: Transform::from_translation(Vec3::new(0.0, 0.0, 1.0)),
+            ..default()
+        },
+    ));
+
+    // Main camera, first to render
+    commands.spawn((
+        MainCamera,
+        Camera3dBundle {
+            camera_3d: Camera3d {
+                clear_color: ClearColorConfig::Custom(Color::BLACK),
+                ..default()
+            },
+            camera: Camera {
+                target: RenderTarget::Image(image_handle.clone()),
+                // order: 2,
+                ..default()
+            },
+            transform: Transform::from_translation(Vec3::new(0.0, 0.0, 50.0))
+                .looking_at(Vec3::default(), Vec3::Y),
+            // transform: Transform::from_xyz(-2.0, 2.5, 100.0).looking_at(Vec3::ZERO, Vec3::Y),
+            ..default()
+        },
+        UiCameraConfig { show_ui: false },
+    ));
+
+    // This specifies the layer used for the post processing camera, which will be attached to the post processing camera and 2d quad.
+    let post_processing_pass_layer = RenderLayers::layer((RenderLayers::TOTAL_LAYERS - 1) as u8);
+
+    let quad_handle: Handle<Mesh> = meshes.add(Mesh::from(shape::Quad::new(Vec2::new(
+        size.width as f32,
+        size.height as f32,
+    ))));
+
+    // This material has the texture that has been rendered.
+    let material_handle = post_processing_materials.add(PostProcessingMaterial {
+        light_position: Vec2 { x: 0.5, y: 0.5 },
+        exposure: 0.18,
+        decay: 0.95,
+        density: 0.8,
+        weight: 0.4,
+        samples: 100,
+        // TODO: Rename into source image
+        color_texture: image_handle,
+    });
+
+    // Post processing 2d quad, with material using the render texture done by the main camera, with a custom shader.
+    commands.spawn((
+        MaterialMesh2dBundle {
+            mesh: quad_handle.into(),
+            material: material_handle,
+            transform: Transform {
+                translation: Vec3::new(0.0, 0.0, 1.5),
+                ..default()
+            },
+            ..default()
+        },
+        post_processing_pass_layer,
+    ));
+
+    // The post-processing pass camera.
+    commands.spawn((
+        Camera2dBundle {
+            camera: Camera {
+                // renders after the first main camera which has default value: 0.
+                order: 1,
+                ..default()
+            },
+            camera_2d: Camera2d {
+                clear_color: ClearColorConfig::Custom(Color::hex("090611").unwrap()),
+                ..default()
+            },
+            ..Camera2dBundle::default()
+        },
+        post_processing_pass_layer,
+    ));
 }
