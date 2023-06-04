@@ -13,9 +13,6 @@ use bevy::{
 
 use crate::entities::player::Player;
 
-
-// TODO: Investigate physics engine such as Rapier => https://rapier.rs/docs/user_guides/bevy_plugin/colliders
-
 pub fn gravity(mut player_query: Query<&mut Transform, With<Player>>) {
     let mut direction = Vec2::ZERO;
     // if keys.any_pressed([KeyCode::Up, KeyCode::W]) {
