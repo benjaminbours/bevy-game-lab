@@ -123,7 +123,12 @@ fn setup(
 
     let image_handle = images.add(image);
 
-    let cube_handle = meshes.add(Mesh::from(shape::Cube { size: 4.0 }));
+    // let cube_handle = meshes.add(Mesh::from(shape::Cube { size: 4.0 }));
+    let cube_handle = meshes.add(Mesh::from(shape::UVSphere {
+        radius: 2.0,
+        sectors: 100,
+        stacks: 100,
+    }));
     let cube_material_handle = materials.add(StandardMaterial {
         base_color: Color::hex("ffffff").unwrap(),
         reflectance: 0.02,
