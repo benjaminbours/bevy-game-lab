@@ -20,7 +20,7 @@ layout(set = 1, binding = 4) uniform float weight;
 layout(set = 1, binding = 5) uniform int samples;
 layout(set = 1, binding = 6) uniform texture2D tDiffuse_texture;
 layout(set = 1, binding = 7) uniform sampler tDiffuse_sampler;
-const int MAX_SAMPLES = 100;
+const int MAX_SAMPLES = 1000;
 
 void main(){
   

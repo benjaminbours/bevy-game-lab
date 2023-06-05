@@ -4,7 +4,7 @@
 
 - Refactor code to properly activate and deactivate the volumetric light shader and the post processing effect
 - Add additive blending shader
-- Add plugin to configure volumetric light with GUI
+- Add hot reloading for shader assets
 - Improve the shader to have kind of pulsating animation
 
 ## Gameplay

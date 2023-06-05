@@ -5,7 +5,7 @@ use bevy::{
         Color, Commands, Component, Handle, Image, Mesh, PbrBundle, Plugin, PointLight,
         PointLightBundle, Query, ResMut, StandardMaterial, Transform, UiCameraConfig, Vec2, Vec3,
     },
-    reflect::TypeUuid,
+    reflect::{Reflect, TypeUuid},
     render::{
         camera::RenderTarget,
         mesh::MeshVertexBufferLayout,
@@ -19,6 +19,10 @@ use bevy::{
     },
     sprite::{Material2d, Material2dKey, Material2dPlugin, MaterialMesh2dBundle},
     window::Window,
+};
+use bevy_inspector_egui::{
+    inspector_options::std_options::NumberDisplay, prelude::ReflectInspectorOptions,
+    quick::AssetInspectorPlugin, InspectorOptions,
 };
 
 use crate::entities::player::Player;
@@ -34,20 +38,26 @@ pub struct MainCamera;
 pub struct PostProcessPlugin;
 
 /// Our custom post processing material
-#[derive(AsBindGroup, TypeUuid, Clone)]
+#[derive(AsBindGroup, TypeUuid, Clone, Reflect, Default, InspectorOptions)]
+#[reflect(InspectorOptions)]
 #[uuid = "bc2f08eb-a0fb-43f1-a908-54871ea597d5"]
 pub struct PostProcessingMaterial {
     #[uniform(0)]
     pub light_position: Vec2,
     #[uniform(1)]
+    #[inspector(min = 0.0, max = 1.0, display = NumberDisplay::Slider)]
     exposure: f32,
     #[uniform(2)]
+    #[inspector(min = 0.8, max = 0.99, display = NumberDisplay::Slider)]
     decay: f32,
     #[uniform(3)]
+    #[inspector(min = 0.0, max = 1.0, display = NumberDisplay::Slider)]
     density: f32,
     #[uniform(4)]
+    #[inspector(min = 0.0, max = 1.0, display = NumberDisplay::Slider)]
     weight: f32,
     #[uniform(5)]
+    #[inspector(min = 0, max = 1000, display = NumberDisplay::Slider)]
     samples: i32,
     #[texture(6)]
     #[sampler(7)]
@@ -80,6 +90,9 @@ impl Material2d for PostProcessingMaterial {
 impl Plugin for PostProcessPlugin {
     fn build(&self, app: &mut App) {
         app.add_plugin(Material2dPlugin::<PostProcessingMaterial>::default())
+            // .add_plugin(WorldInspectorPlugin::new())
+            .add_plugin(AssetInspectorPlugin::<PostProcessingMaterial>::default())
+            .register_type::<PostProcessingMaterial>()
             .add_startup_system(setup);
     }
 }
